@@ -291,7 +291,7 @@ socket_path = ""  # auto-reads CMUX_SOCKET_PATH
 poll_interval_seconds = 5
 max_scrollback_lines  = 300
 db_path               = "~/.context-bridge/sessions.db"
-log_level             = "info"
+log_level             = "warn"
 
 [anthropic]
 api_key    = ""   # or set ANTHROPIC_API_KEY

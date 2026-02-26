@@ -43,6 +43,7 @@ working seamlessly — no manual commands required.`,
 		handoffCmd(),
 		snapshotCmd(),
 		watchCmd(),
+		testCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -106,18 +107,12 @@ This is the core of context-bridge. Run it once and leave it running.`,
 
 			mon.Start()
 
-			slog.Info("context-bridge daemon started",
-				"poll_interval", monCfg.PollInterval,
-				"auto_inject", autoInject,
-				"summarize_on_sync", summarizeOnSync,
-			)
 			fmt.Printf("context-bridge daemon running (auto-inject: %v). Press Ctrl+C to stop.\n", autoInject)
 
 			sig := make(chan os.Signal, 1)
 			signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 			<-sig
 
-			slog.Info("shutting down")
 			mon.Stop()
 			return nil
 		},
@@ -416,6 +411,84 @@ func watchCmd() *cobra.Command {
 	return cmd
 }
 
+// ---- test ------------------------------------------------------------------
+
+func testCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "test",
+		Short: "Test the cmux connection and print raw API responses",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			socketPath := os.Getenv("CMUX_SOCKET_PATH")
+			fmt.Printf("CMUX_SOCKET_PATH = %q\n\n", socketPath)
+			if socketPath == "" {
+				fmt.Println("ERROR: CMUX_SOCKET_PATH is not set.")
+				fmt.Println("You must run bridge from inside a cmux terminal pane.")
+				fmt.Println("Open cmux, open a terminal inside it, then run: bridge test")
+				return nil
+			}
+
+			cfg, _ := config.Load(cfgPath)
+			c, err := cmux.NewClient(cfg.SocketPath())
+			if err != nil {
+				fmt.Printf("ERROR connecting to cmux socket: %v\n", err)
+				return nil
+			}
+			defer c.Close()
+			fmt.Println("Connected to cmux socket OK.\n")
+
+			// Test workspace.list
+			fmt.Println("--- workspace.list ---")
+			raw, err := c.RawCall("workspace.list", nil)
+			if err != nil {
+				fmt.Printf("ERROR: %v\n\n", err)
+			} else {
+				fmt.Printf("%s\n\n", prettyJSON(raw))
+			}
+
+			// Test surface.list
+			fmt.Println("--- surface.list ---")
+			raw, err = c.RawCall("surface.list", nil)
+			if err != nil {
+				fmt.Printf("ERROR: %v\n\n", err)
+			} else {
+				fmt.Printf("%s\n\n", prettyJSON(raw))
+			}
+
+			// Test pane.list
+			fmt.Println("--- pane.list ---")
+			raw, err = c.RawCall("pane.list", nil)
+			if err != nil {
+				fmt.Printf("ERROR: %v\n\n", err)
+			} else {
+				fmt.Printf("%s\n\n", prettyJSON(raw))
+			}
+
+			// Test window.list
+			fmt.Println("--- window.list ---")
+			raw, err = c.RawCall("window.list", nil)
+			if err != nil {
+				fmt.Printf("ERROR: %v\n\n", err)
+			} else {
+				fmt.Printf("%s\n\n", prettyJSON(raw))
+			}
+
+			return nil
+		},
+	}
+}
+
+func prettyJSON(raw []byte) string {
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	_ = enc.Encode(v)
+	return buf.String()
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 func buildDeps(cfg *config.Config) (*cmux.Client, *store.Store, *summarizer.Summarizer, error) {
@@ -438,7 +511,7 @@ func buildDeps(cfg *config.Config) (*cmux.Client, *store.Store, *summarizer.Summ
 			slog.Warn("summarizer unavailable", "err", err)
 		}
 	} else {
-		slog.Warn("ANTHROPIC_API_KEY not set — LLM summarization disabled; fallback summaries will be used")
+		slog.Debug("ANTHROPIC_API_KEY not set — LLM summarization disabled; fallback summaries will be used")
 	}
 
 	return cmuxClient, s, sum, nil

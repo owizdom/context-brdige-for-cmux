@@ -75,7 +75,7 @@ func defaults() *Config {
 			PollIntervalSeconds: 5,
 			MaxScrollbackLines:  300,
 			DBPath:              "~/.context-bridge/sessions.db",
-			LogLevel:            "info",
+			LogLevel:            "warn",
 		},
 		Anthropic: AnthropicConfig{
 			Model:     "claude-haiku-4-5-20251001",

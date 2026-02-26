@@ -85,7 +85,7 @@ func (e *Engine) Execute(req HandoffRequest) (*Result, error) {
 		return nil, fmt.Errorf("load source context: %w", err)
 	}
 
-	slog.Info("handoff: source loaded",
+	slog.Debug("handoff: source loaded",
 		"session", srcCtx.SessionID,
 		"agent", srcCtx.Agent,
 		"goal", srcCtx.Task.Goal,
@@ -93,7 +93,7 @@ func (e *Engine) Execute(req HandoffRequest) (*Result, error) {
 
 	// 2. Summarize if we don't have a summary yet.
 	if srcCtx.Summary == "" && e.sum != nil {
-		slog.Info("handoff: summarizing context...")
+		slog.Debug("handoff: summarizing context")
 		summary, serr := e.sum.Summarize(*srcCtx)
 		if serr != nil {
 			slog.Warn("handoff: summarization failed, using excerpt", "err", serr)
@@ -133,7 +133,7 @@ func (e *Engine) Execute(req HandoffRequest) (*Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create workspace: %w", err)
 		}
-		slog.Info("handoff: created workspace", "id", workspaceID)
+		slog.Debug("handoff: created workspace", "id", workspaceID)
 
 		// Give cmux a moment to initialize the pane.
 		time.Sleep(500 * time.Millisecond)
@@ -186,7 +186,7 @@ func (e *Engine) Execute(req HandoffRequest) (*Result, error) {
 		surfaceID,
 	)
 
-	slog.Info("handoff: complete",
+	slog.Info("handoff complete",
 		"from", srcCtx.Agent,
 		"to", req.ToAgent,
 		"workspace", workspaceID,
@@ -210,18 +210,27 @@ func (e *Engine) AutoInject(newCtx parser.Context) {
 		return // no prior session to pull from
 	}
 
-	// Find the most recent session that is NOT this surface, has a task goal,
-	// and shares context signals (cwd or git branch).
+	// Find the most recent session that is NOT this surface, has useful context,
+	// and shares project signals (cwd or git branch).
+	const freshContextWindow = 10 * time.Minute
 	var candidate *parser.Context
 	for i := range all {
 		c := &all[i]
-		if c.SurfaceID == newCtx.SurfaceID {
+		if c.SurfaceID == newCtx.SurfaceID || c.Agent == parser.AgentUnknown {
 			continue
 		}
-		if c.Task.Goal == "" {
+		if c.CapturedAt.IsZero() || c.CapturedAt.Before(time.Now().Add(-freshContextWindow)) {
 			continue
 		}
-		if c.CWD == newCtx.CWD || (c.GitBranch != "" && c.GitBranch == newCtx.GitBranch) {
+		if isHandoffSeedSession(*c) {
+			continue
+		}
+		if !(c.CWD == newCtx.CWD || (c.GitBranch != "" && c.GitBranch == newCtx.GitBranch)) {
+			continue
+		}
+
+		hasSignal := isUsefulContext(*c)
+		if hasSignal {
 			candidate = c
 			break
 		}
@@ -230,7 +239,7 @@ func (e *Engine) AutoInject(newCtx parser.Context) {
 		return // no related session found
 	}
 
-	slog.Info("auto-inject: found related session",
+	slog.Debug("auto-inject: found related session",
 		"from_agent", candidate.Agent,
 		"to_agent", newCtx.Agent,
 		"goal", candidate.Task.Goal,
@@ -273,11 +282,31 @@ func (e *Engine) AutoInject(newCtx parser.Context) {
 		newCtx.SurfaceID,
 	)
 
-	slog.Info("auto-inject: context injected",
+	slog.Info("auto-inject complete",
 		"from", candidate.Agent,
 		"to", newCtx.Agent,
 		"surface", newCtx.SurfaceID,
 	)
+}
+
+func isHandoffSeedSession(ctx parser.Context) bool {
+	return strings.Contains(ctx.RawSnapshot, "# Context Handoff from ") ||
+		strings.Contains(strings.ToLower(ctx.Task.Goal), "context handoff from ") ||
+		strings.Contains(strings.ToLower(ctx.ConversationExcerpt), "context handoff from ")
+}
+
+func isUsefulContext(ctx parser.Context) bool {
+	if strings.TrimSpace(ctx.Task.Goal) != "" {
+		return true
+	}
+	if len(ctx.FileChanges) > 0 {
+		return true
+	}
+	excerpt := strings.TrimSpace(ctx.ConversationExcerpt)
+	if excerpt == "" {
+		return false
+	}
+	return false
 }
 
 // buildFallbackSummary creates a summary without LLM when the API is unavailable.

@@ -5,6 +5,7 @@ package monitor
 import (
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,10 @@ type Monitor struct {
 	OnContextUpdate func(ctx parser.Context)
 	stopCh  chan struct{}
 	stopped bool
+	// Number of active non-unknown agent surfaces currently tracked by workspace.
+	agentSurfaceCountByWorkspace map[string]int
+	// Whether this workspace has already seen one valid agent session in this daemon run.
+	workspacePrimedForAutoInject map[string]bool
 }
 
 // New creates a Monitor.
@@ -65,10 +70,14 @@ func New(c *cmux.Client, s *store.Store, sum *summarizer.Summarizer, cfg Config)
 		store:      s,
 		summarizer: sum,
 		cfg:        cfg,
-		surfaces:   make(map[string]*SurfaceState),
-		stopCh:     make(chan struct{}),
+		surfaces:                     make(map[string]*SurfaceState),
+		agentSurfaceCountByWorkspace: make(map[string]int),
+		workspacePrimedForAutoInject: make(map[string]bool),
+		stopCh:                       make(chan struct{}),
 	}
 }
+
+var shellCommandLineRe = regexp.MustCompile(`(?m)^\\s*[^\\s]+@[^\\s]+.*[\\$%>]\\s+[^\\s]+.*$`)
 
 // Start begins the polling loop in the background.
 func (m *Monitor) Start() {
@@ -103,18 +112,26 @@ func (m *Monitor) loop() {
 func (m *Monitor) poll() {
 	workspaces, err := m.cmuxClient.ListWorkspaces()
 	if err != nil {
-		slog.Warn("poll: list workspaces", "err", err)
+		slog.Warn("poll: workspace.list failed", "err", err)
 		return
 	}
+
+	if len(workspaces) == 0 {
+		slog.Debug("poll: 0 workspaces — open a tab in cmux first")
+		return
+	}
+
+	slog.Debug("poll: scanning", "workspaces", len(workspaces))
 
 	seen := map[string]bool{}
 
 	for _, ws := range workspaces {
 		surfaces, err := m.cmuxClient.ListSurfaces(ws.ID)
 		if err != nil {
-			slog.Warn("poll: list surfaces", "workspace", ws.ID, "err", err)
-			continue
-		}
+		slog.Warn("poll: surface.list failed", "workspace", ws.ID, "err", err)
+		continue
+	}
+		slog.Debug("poll: workspace", "id", ws.ID[:min(8, len(ws.ID))], "title", ws.Title, "surfaces", len(surfaces))
 		for _, surf := range surfaces {
 			seen[surf.ID] = true
 			m.processSurface(surf, ws)
@@ -125,7 +142,14 @@ func (m *Monitor) poll() {
 	m.mu.Lock()
 	for id := range m.surfaces {
 		if !seen[id] {
+			wsID := m.surfaces[id].WorkspaceID
 			delete(m.surfaces, id)
+			if wsID != "" && m.agentSurfaceCountByWorkspace[wsID] > 0 {
+				m.agentSurfaceCountByWorkspace[wsID]--
+				if m.agentSurfaceCountByWorkspace[wsID] <= 0 {
+					m.workspacePrimedForAutoInject[wsID] = false
+				}
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -134,7 +158,7 @@ func (m *Monitor) poll() {
 func (m *Monitor) processSurface(surf cmux.Surface, ws cmux.Workspace) {
 	scrollback, err := m.cmuxClient.ReadTerminalText(surf.ID, m.cfg.MaxScrollback)
 	if err != nil {
-		slog.Debug("read terminal", "surface", surf.ID, "err", err)
+		slog.Debug("poll: read_text failed", "surface", surf.ID, "err", err)
 		return
 	}
 	if strings.TrimSpace(scrollback) == "" {
@@ -143,14 +167,20 @@ func (m *Monitor) processSurface(surf cmux.Surface, ws cmux.Workspace) {
 
 	detected := parser.DetectAgent(scrollback)
 	agentType := detected.AgentType()
-	if agentType == parser.AgentUnknown && isJustShellPrompt(scrollback) {
-		// Don't track bare shell sessions with no agent.
+	// Only track agent sessions; skip shell-only sessions to avoid injecting into every new terminal.
+	if agentType == parser.AgentUnknown && isLikelyShellSession(scrollback) {
+		return
+	}
+	// Skip unknown sessions entirely so we don't block auto-inject when an agent starts later in
+	// the same shell surface.
+	if agentType == parser.AgentUnknown {
 		return
 	}
 
 	m.mu.Lock()
 	state, exists := m.surfaces[surf.ID]
 	isNew := !exists
+	workspacePrimed := m.workspacePrimedForAutoInject[ws.ID]
 	if !exists {
 		sessionID := makeSessionID(surf.ID)
 		state = &SurfaceState{
@@ -161,6 +191,7 @@ func (m *Monitor) processSurface(surf cmux.Surface, ws cmux.Workspace) {
 			IsNew:       true,
 		}
 		m.surfaces[surf.ID] = state
+		m.agentSurfaceCountByWorkspace[ws.ID]++
 	}
 	state.LastSeen = time.Now()
 	sessionID := state.SessionID
@@ -189,18 +220,39 @@ func (m *Monitor) processSurface(surf cmux.Surface, ws cmux.Workspace) {
 	}
 
 	if isNew {
-		slog.Info("new agent session detected",
+		slog.Debug("new agent session detected",
 			"agent", agentType,
 			"surface", surf.ID,
 			"workspace", ws.Title,
 			"goal", ctx.Task.Goal,
 		)
-		if m.OnNewSession != nil {
+		// Only auto-inject after the first valid agent in this workspace.
+		if workspacePrimed && m.OnNewSession != nil {
 			m.OnNewSession(ctx)
 		}
+		m.workspacePrimedForAutoInject[ws.ID] = true
 	} else if m.OnContextUpdate != nil {
 		m.OnContextUpdate(ctx)
 	}
+}
+
+func isLikelyShellSession(s string) bool {
+	if isJustShellPrompt(s) {
+		return true
+	}
+	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "Last login:") {
+			return true
+		}
+		if shellCommandLineRe.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Monitor) summarizeAsync(ctx parser.Context) {

@@ -1,8 +1,8 @@
 // Package cmux provides a client for the cmux Unix domain socket API (v2).
-// Docs: https://github.com/manaflow-ai/cmux
 package cmux
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,22 +12,23 @@ import (
 	"time"
 )
 
-// Client is a thread-safe JSON-RPC client over a Unix domain socket.
+// Client connects to the cmux Unix domain socket.
 type Client struct {
 	socketPath string
-	conn       net.Conn
-	mu         sync.Mutex
 	idCounter  atomic.Uint64
+	mu         sync.Mutex
+
+	readTextMethod string // e.g. "surface.read_text"
+	readTextIDKey  string // e.g. "surface_id"
+	readTextLineKey string // e.g. "lines"
 }
 
-// request is the cmux JSON-RPC v2 request envelope.
 type request struct {
 	ID     string         `json:"id"`
 	Method string         `json:"method"`
 	Params map[string]any `json:"params,omitempty"`
 }
 
-// response is the cmux JSON-RPC v2 response envelope.
 type response struct {
 	ID     string          `json:"id"`
 	OK     bool            `json:"ok"`
@@ -44,8 +45,6 @@ func (e *rpcError) Error() string {
 	return fmt.Sprintf("cmux error %s: %s", e.Code, e.Message)
 }
 
-// NewClient creates a new cmux client. socketPath may be empty, in which case
-// the CMUX_SOCKET_PATH environment variable is used.
 func NewClient(socketPath string) (*Client, error) {
 	if socketPath == "" {
 		socketPath = os.Getenv("CMUX_SOCKET_PATH")
@@ -54,25 +53,24 @@ func NewClient(socketPath string) (*Client, error) {
 		return nil, fmt.Errorf("cmux socket path not set: provide via config or CMUX_SOCKET_PATH env var")
 	}
 	c := &Client{socketPath: socketPath}
-	if err := c.connect(); err != nil {
-		return nil, err
+	// Verify the socket is reachable.
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to cmux socket %s: %w", socketPath, err)
 	}
+	conn.Close()
 	return c, nil
 }
 
-func (c *Client) connect() error {
+// call opens a fresh connection for each request, sends it, reads the response,
+// and closes. Fresh-per-request avoids all decoder buffering issues.
+func (c *Client) call(method string, params map[string]any) (json.RawMessage, error) {
 	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
 	if err != nil {
-		return fmt.Errorf("connect to cmux socket %s: %w", c.socketPath, err)
+		return nil, fmt.Errorf("dial cmux socket: %w", err)
 	}
-	c.conn = conn
-	return nil
-}
-
-// call sends a JSON-RPC request and returns the raw result bytes.
-func (c *Client) call(method string, params map[string]any) (json.RawMessage, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	id := fmt.Sprintf("%d", c.idCounter.Add(1))
 	req := request{ID: id, Method: method, Params: params}
@@ -82,75 +80,70 @@ func (c *Client) call(method string, params map[string]any) (json.RawMessage, er
 	}
 	data = append(data, '\n')
 
-	_ = c.conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := c.conn.Write(data); err != nil {
-		// Try reconnect once.
-		if rerr := c.connect(); rerr != nil {
-			return nil, fmt.Errorf("write failed and reconnect failed: %w", rerr)
-		}
-		_ = c.conn.SetDeadline(time.Now().Add(10 * time.Second))
-		if _, err := c.conn.Write(data); err != nil {
-			return nil, fmt.Errorf("write after reconnect: %w", err)
-		}
+	if _, err := conn.Write(data); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
 	}
 
-	dec := json.NewDecoder(c.conn)
+	reader := bufio.NewReader(conn)
 	var resp response
-	if err := dec.Decode(&resp); err != nil {
+	if err := json.NewDecoder(reader).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if !resp.OK {
 		if resp.Error != nil {
 			return nil, resp.Error
 		}
-		return nil, fmt.Errorf("cmux returned ok=false with no error detail")
+		return nil, fmt.Errorf("cmux returned ok=false (no detail)")
 	}
 	return resp.Result, nil
 }
 
-// Close closes the underlying connection.
-func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.Close()
+// RawCall sends a request and returns raw result bytes — used by bridge test.
+func (c *Client) RawCall(method string, params map[string]any) ([]byte, error) {
+	return c.call(method, params)
 }
+
+// Close is a no-op (connections are per-call now).
+func (c *Client) Close() error { return nil }
 
 // ---- Typed API methods ----
 
-// Workspace represents a cmux workspace (tab).
 type Workspace struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	CustomTitle  string `json:"custom_title,omitempty"`
-	GitBranch    string `json:"git_branch,omitempty"`
-	CurrentDir   string `json:"current_directory,omitempty"`
-	WindowID     string `json:"window_id,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	CustomTitle string `json:"custom_title,omitempty"`
+	GitBranch   string `json:"git_branch,omitempty"`
+	CurrentDir  string `json:"current_directory,omitempty"`
+	WindowID    string `json:"window_id,omitempty"`
 }
 
-// Surface represents a terminal pane within a workspace.
 type Surface struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	Title       string `json:"title,omitempty"`
-	CurrentDir  string `json:"current_directory,omitempty"`
+	CurrentDir  string `json:"current_directory,omitempty"` // may be empty — fall back to Title
 }
 
-// ListWorkspaces returns all workspaces across all windows.
 func (c *Client) ListWorkspaces() ([]Workspace, error) {
 	raw, err := c.call("workspace.list", nil)
 	if err != nil {
 		return nil, err
 	}
-	var result struct {
+	// Try wrapped format first: {"workspaces": [...]}
+	var wrapped struct {
 		Workspaces []Workspace `json:"workspaces"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &wrapped); err == nil && wrapped.Workspaces != nil {
+		return wrapped.Workspaces, nil
 	}
-	return result.Workspaces, nil
+	// Try bare array: [...]
+	var list []Workspace
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
+	}
+	return nil, fmt.Errorf("unexpected workspace.list response: %s", string(raw))
 }
 
-// ListSurfaces returns all surfaces (panes) in a workspace.
 func (c *Client) ListSurfaces(workspaceID string) ([]Surface, error) {
 	params := map[string]any{}
 	if workspaceID != "" {
@@ -160,36 +153,138 @@ func (c *Client) ListSurfaces(workspaceID string) ([]Surface, error) {
 	if err != nil {
 		return nil, err
 	}
-	var result struct {
+	var wrapped struct {
 		Surfaces []Surface `json:"surfaces"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &wrapped); err == nil && wrapped.Surfaces != nil {
+		return wrapped.Surfaces, nil
 	}
-	return result.Surfaces, nil
+	var list []Surface
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
+	}
+	return nil, fmt.Errorf("unexpected surface.list response: %s", string(raw))
 }
 
-// ReadTerminalText reads the scrollback text of a surface.
-// maxLines controls how many lines to read (0 = server default).
 func (c *Client) ReadTerminalText(surfaceID string, maxLines int) (string, error) {
-	params := map[string]any{"surface_id": surfaceID}
-	if maxLines > 0 {
-		params["lines"] = maxLines
+	type candidate struct {
+		method  string
+		idKey   string
+		lineKey string
 	}
-	raw, err := c.call("debug.terminal.read_text", params)
+
+	c.mu.Lock()
+	cachedMethod := c.readTextMethod
+	cachedIDKey := c.readTextIDKey
+	cachedLineKey := c.readTextLineKey
+	c.mu.Unlock()
+
+	candidates := []candidate{}
+	if cachedMethod != "" && cachedIDKey != "" && cachedLineKey != "" {
+		candidates = append(candidates, candidate{
+			method:  cachedMethod,
+			idKey:   cachedIDKey,
+			lineKey: cachedLineKey,
+		})
+	}
+	candidates = append(candidates,
+		candidate{method: "surface.read_text", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "surface.read_text", idKey: "surface_id", lineKey: "max_lines"},
+		candidate{method: "surface.read_text", idKey: "surface_id", lineKey: "limit"},
+		candidate{method: "surface.read_text", idKey: "pane_id", lineKey: "lines"},
+		candidate{method: "surface.read_text", idKey: "pane_id", lineKey: "max_lines"},
+		candidate{method: "surface.get_text", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "surface.get_scrollback", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "surface.read_text", idKey: "id", lineKey: "lines"},
+		candidate{method: "surface.get_text", idKey: "surface_id", lineKey: "max_lines"},
+		candidate{method: "surface.get_scrollback", idKey: "surface_id", lineKey: "max_lines"},
+		candidate{method: "terminal.get_text", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "terminal.get_scrollback", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "terminal.read_text", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "terminal.read_text", idKey: "surface_id", lineKey: "max_lines"},
+		candidate{method: "terminal.read_text", idKey: "surface_id", lineKey: "limit"},
+		candidate{method: "terminal.get_scrollback", idKey: "surface_id", lineKey: "max_lines"},
+		candidate{method: "pane.read_text", idKey: "pane_id", lineKey: "lines"},
+		candidate{method: "pane.read_text", idKey: "pane_id", lineKey: "max_lines"},
+		candidate{method: "pane.get_text", idKey: "pane_id", lineKey: "lines"},
+		candidate{method: "debug.terminal.read_text", idKey: "surface_id", lineKey: "lines"},
+		candidate{method: "debug.terminal.read_text", idKey: "surface_id", lineKey: "max_lines"},
+	)
+
+	seen := map[string]struct{}{}
+	var lastErr error
+	for _, candidate := range candidates {
+		key := candidate.method + "|" + candidate.idKey + "|" + candidate.lineKey
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		text, err := c.readTerminalText(surfaceID, maxLines, candidate)
+		if err == nil {
+			c.mu.Lock()
+			if c.readTextMethod == "" {
+				c.readTextMethod = candidate.method
+				c.readTextIDKey = candidate.idKey
+				c.readTextLineKey = candidate.lineKey
+			}
+			c.mu.Unlock()
+			return text, nil
+		}
+		lastErr = err
+		if !isRetryableReadTextError(err) {
+			return "", err
+		}
+	}
+
+	return "", lastErr
+}
+
+func (c *Client) readTerminalText(surfaceID string, maxLines int, candidate struct {
+	method  string
+	idKey   string
+	lineKey string
+}) (string, error) {
+	params := map[string]any{
+		candidate.idKey: surfaceID,
+	}
+	if maxLines > 0 {
+		params[candidate.lineKey] = maxLines
+	}
+	raw, err := c.call(candidate.method, params)
 	if err != nil {
 		return "", err
 	}
+	return c.parseTextResult(raw)
+}
+
+func (c *Client) parseTextResult(raw json.RawMessage) (string, error) {
 	var result struct {
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", err
+	if err := json.Unmarshal(raw, &result); err == nil && result.Text != "" {
+		return result.Text, nil
 	}
-	return result.Text, nil
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, nil
+	}
+	return string(raw), nil
 }
 
-// SendText sends text to a surface (as if typed by the user).
+func isRetryableReadTextError(err error) bool {
+	e, ok := err.(*rpcError)
+	if !ok {
+		return false
+	}
+	switch e.Code {
+	case "method_not_found", "invalid_params", "invalid_request", "invalid_arguments", "bad_request":
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) SendText(surfaceID, text string) error {
 	_, err := c.call("surface.send_text", map[string]any{
 		"surface_id": surfaceID,
@@ -198,7 +293,6 @@ func (c *Client) SendText(surfaceID, text string) error {
 	return err
 }
 
-// CreateWorkspace creates a new workspace (tab) and returns its ID.
 func (c *Client) CreateWorkspace(title string) (string, error) {
 	params := map[string]any{}
 	if title != "" {
@@ -211,24 +305,25 @@ func (c *Client) CreateWorkspace(title string) (string, error) {
 	var result struct {
 		WorkspaceID string `json:"workspace_id"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", err
+	if err := json.Unmarshal(raw, &result); err != nil || result.WorkspaceID == "" {
+		// Try {"id": "..."}
+		var r2 struct {
+			ID string `json:"id"`
+		}
+		if err2 := json.Unmarshal(raw, &r2); err2 == nil {
+			return r2.ID, nil
+		}
 	}
 	return result.WorkspaceID, nil
 }
 
-// SelectWorkspace switches focus to a workspace.
 func (c *Client) SelectWorkspace(workspaceID string) error {
 	_, err := c.call("workspace.select", map[string]any{"workspace_id": workspaceID})
 	return err
 }
 
-// CreateNotification sends a rich notification tied to a surface.
 func (c *Client) CreateNotification(title, body, surfaceID string) error {
-	params := map[string]any{
-		"title": title,
-		"body":  body,
-	}
+	params := map[string]any{"title": title, "body": body}
 	if surfaceID != "" {
 		params["surface_id"] = surfaceID
 		_, err := c.call("notification.create_for_surface", params)

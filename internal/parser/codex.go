@@ -13,10 +13,11 @@ func (p *CodexParser) AgentType() AgentType { return AgentCodex }
 
 var (
 	codexPromptRe  = regexp.MustCompile(`(?m)^codex>\s*`)
+	codexPromptInputRe = regexp.MustCompile(`(?m)^›\s*(.+)`)
 	codexApplyRe   = regexp.MustCompile(`(?m)(applying patch|writing file|creating file)[^\n]*:\s*([^\n]+)`)
 	codexUserRe    = regexp.MustCompile(`(?m)^(user|you):\s*(.+)`)
 	codexAssistRe  = regexp.MustCompile(`(?m)^(assistant|codex):\s*(.+)`)
-	codexErrorRe   = regexp.MustCompile(`(?mi)(error|failed|exception)[^\n]{0,120}`)
+	codexErrorRe   = regexp.MustCompile(`(?mi)^\s*(error|exception)\b[^\n]{0,120}`)
 )
 
 func (p *CodexParser) Detect(s string) bool {
@@ -30,6 +31,7 @@ func (p *CodexParser) Parse(scrollback string) Context {
 		Agent:       AgentCodex,
 		CapturedAt:  time.Now(),
 		RawSnapshot: scrollback,
+		Task:        Task{Status: StatusInProgress},
 	}
 
 	// Extract file changes from "applying patch: path" lines.
@@ -61,9 +63,14 @@ func (p *CodexParser) Parse(scrollback string) Context {
 
 	// Task goal from last user: turn.
 	userMatches := codexUserRe.FindAllStringSubmatch(scrollback, -1)
-	task := Task{Status: StatusInProgress}
 	if len(userMatches) > 0 {
-		task.Goal = strings.TrimSpace(userMatches[len(userMatches)-1][2])
+		ctx.Task.Goal = strings.TrimSpace(userMatches[len(userMatches)-1][2])
+	}
+	if ctx.Task.Goal == "" {
+		promptMatches := codexPromptInputRe.FindAllStringSubmatch(scrollback, -1)
+		if len(promptMatches) > 0 {
+			ctx.Task.Goal = strings.TrimSpace(promptMatches[len(promptMatches)-1][1])
+		}
 	}
 
 	// Idle detection.
@@ -71,10 +78,9 @@ func (p *CodexParser) Parse(scrollback string) Context {
 	if len(lines) > 0 {
 		last := strings.TrimSpace(lines[len(lines)-1])
 		if strings.HasSuffix(last, "> ") || last == "codex>" {
-			task.Status = StatusIdle
+			ctx.Task.Status = StatusIdle
 		}
 	}
-	ctx.Task = task
 	ctx.ConversationExcerpt = lastNLines(scrollback, 40)
 	return ctx
 }
