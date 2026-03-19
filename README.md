@@ -344,14 +344,11 @@ Mnemo is the only tool that gives CLI coding agents cross-session, cross-agent m
 
 ## Roadmap
 
-- [ ] Zellij backend
-- [ ] WezTerm backend
-- [ ] OpenCode parser
-- [ ] Kiro parser
-- [ ] MCP server mode — expose context store as an MCP tool
-- [ ] Git-aware context — track commits per session
-- [ ] Context search — `mnemo search "JWT auth"`
-- [ ] Team sync — shared context store across machines
+- [ ] **MCP server mode** — expose the context store as an MCP tool so any agent can query session history directly, not just at handoff time
+- [ ] **Git-aware context** — track commits made during a session and surface structured diffs as part of the handoff, not just file paths
+- [ ] **Context search** — semantic search across all stored sessions (`mnemo search "JWT auth"`) so you can pull context from days ago, not just the last session
+- [ ] **Persistent agent profiles** — learn how each agent type uses context best and tailor injection format per agent (Claude wants markdown, Codex wants diffs, Aider wants file lists)
+- [ ] **Team sync** — shared context store across machines so handoffs work across developers, not just across your own tabs
 
 ---
 
